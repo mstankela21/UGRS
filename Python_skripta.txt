@@ -1,0 +1,148 @@
+import os
+import time
+import base64
+import serial
+import cv2
+import numpy as np
+ 
+# ==========================================
+# CONFIGURATION
+# ==========================================
+SERIAL_PORT = "COM3"     
+BAUD_RATE = 460800
+ 
+IMAGE_WIDTH = 240
+IMAGE_HEIGHT = 240
+ 
+DATASET_DIR = "dataset"
+DISPLAY_SIZE = 480
+# ==========================================
+ 
+print(f"Connecting to ESP32 on {SERIAL_PORT}...")
+ 
+try:
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=2)
+except Exception as e:
+    print(f"Failed to open serial port: {e}")
+    print("Make sure the Arduino Serial Monitor is CLOSED.")
+    exit()
+ 
+print("Connected!")
+print("Receiving live video... Press 'q' to quit.\n")
+ 
+counter = 108
+ 
+while True:
+    try:
+        line = ser.readline().decode("utf-8", errors="ignore").strip()
+ 
+        if not line:
+            continue
+ 
+        # Normal log messages
+        if "FRAME_START:" not in line:
+            print("ESP32:", line)
+            continue
+ 
+        # Parse frame
+        try:
+            payload = line.split("FRAME_START:")[1].split(":FRAME_END")[0]
+        except IndexError:
+            continue
+ 
+        if "|" in payload:
+            status, b64_data = payload.split("|", 1)
+        else:
+            status = "UNKNOWN"
+            b64_data = payload
+ 
+        status = status.strip().upper()
+ 
+        try:
+            raw_data = base64.b64decode(b64_data)
+ 
+            expected_size = IMAGE_WIDTH * IMAGE_HEIGHT
+ 
+            if len(raw_data) != expected_size:
+                print(f"Skipped incomplete frame ({len(raw_data)} bytes)")
+                continue
+ 
+            # Convert to image
+            img = np.frombuffer(raw_data, dtype=np.uint8).reshape(
+                (IMAGE_HEIGHT, IMAGE_WIDTH)
+            )
+ 
+ 
+ 
+            save_folder = os.path.join(DATASET_DIR, "BAD")
+            os.makedirs(save_folder, exist_ok=True)
+ 
+            timestamp = int(time.time() * 1000)
+ 
+            filename = os.path.join(
+                save_folder,
+                f"BAD_{counter:06d}_{timestamp}.png",
+            )
+ 
+            saved = cv2.imwrite(filename, img)
+ 
+            if saved:
+                print(f"[{counter}] Saved -> {filename}")
+                counter += 1
+            else:
+                print("Failed to save image!")
+ 
+            # ===============================
+            # Display Image
+            # ===============================
+ 
+            display = cv2.resize(
+                img,
+                (DISPLAY_SIZE, DISPLAY_SIZE),
+                interpolation=cv2.INTER_NEAREST,
+            )
+ 
+            display = cv2.cvtColor(display, cv2.COLOR_GRAY2BGR)
+ 
+            color = (0, 255, 0)
+ 
+            if "BAD" in status:
+                color = (0, 0, 255)
+            elif "UNKNOWN" in status:
+                color = (0, 255, 255)
+ 
+            cv2.putText(
+                display,
+                status,
+                (15, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                color,
+                2,
+            )
+ 
+            cv2.putText(
+                display,
+                f"Saved: {counter}",
+                (15, 80),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+            )
+ 
+            cv2.imshow("ESP32-S3 Live Feed", display)
+ 
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+ 
+        except Exception as e:
+            print("Frame decode error:", e)
+ 
+    except KeyboardInterrupt:
+        break
+ 
+print("\nClosing...")
+ 
+ser.close()
+cv2.destroyAllWindows()

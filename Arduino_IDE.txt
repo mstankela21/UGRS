@@ -1,0 +1,202 @@
+#define CAMERA_MODEL_ESP32S3_EYE
+#include "camera_pins.h"
+ 
+#include <URSFinal_inferencing.h>
+#include "edge-impulse-sdk/dsp/image/image.hpp"
+#include "esp_camera.h"
+ 
+// --- PINS ---
+#define LDR_PIN 1
+#define GREEN_LED 3
+#define RED_LED 41
+#define IR_LED_PIN 42
+ 
+const int DARK_THRESHOLD = 1500;
+ 
+uint8_t *snapshot_buf = nullptr;
+ 
+
+const int HISTORY = 5;
+const int REQUIRED_CONSECUTIVE = 3;
+ 
+const float BAD_THRESHOLD = 0.75;
+const float GOOD_THRESHOLD = 0.65;
+ 
+float history[HISTORY] = {0};
+int historyIndex = 0;
+ 
+bool currentBadState = false;   
+int oppositeCount = 0;
+ 
+ 
+static camera_config_t camera_config = {
+    .pin_pwdn  = PWDN_GPIO_NUM,
+    .pin_reset = RESET_GPIO_NUM,
+    .pin_xclk  = XCLK_GPIO_NUM,
+    .pin_sscb_sda = SIOD_GPIO_NUM,
+    .pin_sscb_scl = SIOC_GPIO_NUM,
+    .pin_d7 = Y9_GPIO_NUM, .pin_d6 = Y8_GPIO_NUM, .pin_d5 = Y7_GPIO_NUM, .pin_d4 = Y6_GPIO_NUM,
+    .pin_d3 = Y5_GPIO_NUM, .pin_d2 = Y4_GPIO_NUM, .pin_d1 = Y3_GPIO_NUM, .pin_d0 = Y2_GPIO_NUM,
+    .pin_vsync = VSYNC_GPIO_NUM, .pin_href = HREF_GPIO_NUM, .pin_pclk = PCLK_GPIO_NUM,
+ 
+    .xclk_freq_hz = 10000000,
+    .ledc_timer   = LEDC_TIMER_0,
+    .ledc_channel = LEDC_CHANNEL_0,
+    .pixel_format = PIXFORMAT_GRAYSCALE,
+    .frame_size   = FRAMESIZE_240X240, 
+    .jpeg_quality = 15,
+    .fb_count     = 1,               
+    .fb_location  = CAMERA_FB_IN_DRAM,
+    .grab_mode    = CAMERA_GRAB_LATEST,
+};
+ 
+ 
+void setup() {
+    Serial.begin(460800);
+    delay(500); 
+ 
+    analogReadResolution(12);
+    pinMode(GREEN_LED, OUTPUT);
+    pinMode(RED_LED, OUTPUT);
+    pinMode(IR_LED_PIN, OUTPUT);
+ 
+    snapshot_buf = (uint8_t*)heap_caps_malloc((240 * 240 * 3) + 8192, MALLOC_CAP_SPIRAM);
+    if (!snapshot_buf) {
+        Serial.println("FATAL: snapshot_buf alloc failed — not enough PSRAM");
+        while(1);
+    }
+ 
+    if (esp_camera_init(&camera_config) != ESP_OK) {
+        Serial.println("FATAL: Camera Init Failed");
+        while(1);
+    }
+ 
+    sensor_t * s = esp_camera_sensor_get();
+    if (s != nullptr) {
+        s->set_contrast(s, 0);      
+        s->set_brightness(s, -1);     
+        s->set_sharpness(s, 1);      
+        s->set_lenc(s, 1);           
+        s->set_aec2(s, 1);            
+        s->set_ae_level(s, -2);      
+        s->set_gainceiling(s, (gainceiling_t)2); 
+    }
+ 
+    Serial.println("Memory Secured. Device Starting...");
+}
+ 
+void loop() {
+    // NIGHT VISION
+    static int check_count = 0;
+    if (check_count++ % 10 == 0) {
+        digitalWrite(IR_LED_PIN, (analogRead(LDR_PIN) < DARK_THRESHOLD));
+    }
+ 
+    // CAPTURE
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) return;
+    esp_camera_fb_return(fb);         
+    fb = esp_camera_fb_get();         
+    if (!fb) return;
+ 
+    if (!snapshot_buf) {
+        esp_camera_fb_return(fb);
+        while(1);
+    }
+ 
+    // IMAGE PROCESSING
+    size_t total_pixels = fb->width * fb->height;
+    for (size_t i = 0; i < total_pixels; i++) {
+        uint8_t gray = fb->buf[i];
+        snapshot_buf[i*3] = gray;
+        snapshot_buf[i*3 + 1] = gray;
+        snapshot_buf[i*3 + 2] = gray;
+    }
+    esp_camera_fb_return(fb);
+ 
+    // RUN AI
+    ei::signal_t signal;
+    signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
+    signal.get_data = [](size_t offset, size_t length, float *out_ptr) -> int {
+        if (!snapshot_buf || !out_ptr) return -1;
+ 
+        for (size_t i = 0; i < length; i++) {
+            size_t ai_pixel = offset + i;
+ 
+            // AI coordinates (0 to 95)
+            int ai_x = ai_pixel % EI_CLASSIFIER_INPUT_WIDTH;
+            int ai_y = ai_pixel / EI_CLASSIFIER_INPUT_WIDTH;
+ 
+            // Map AI coordinates to the 240x240 camera coordinates
+            int cam_x = (ai_x * 240) / EI_CLASSIFIER_INPUT_WIDTH;
+            int cam_y = (ai_y * 240) / EI_CLASSIFIER_INPUT_HEIGHT;
+ 
+            size_t cam_pixel_ix = (cam_y * 240 + cam_x) * 3;
+ 
+            out_ptr[i] = (snapshot_buf[cam_pixel_ix + 2] << 16)
+                       + (snapshot_buf[cam_pixel_ix + 1] << 8)
+                       + snapshot_buf[cam_pixel_ix];
+        }
+        return 0;
+    };
+ 
+    ei_impulse_result_t result = { 0 };
+    EI_IMPULSE_ERROR err = run_classifier(&signal, &result, false);
+    if (err != EI_IMPULSE_OK) {
+        Serial.printf("ERR: run_classifier failed, code %d\n", err);
+        return;
+    }
+ 
+    // 5. READ RESULT
+    float bad = 0;
+    for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+        if (strcmp(result.classification[i].label, "bad") == 0) {
+            bad = result.classification[i].value;
+            break;
+        }
+    }
+ 
+    history[historyIndex] = bad;
+    historyIndex = (historyIndex + 1) % HISTORY;
+ 
+    float avgBad = 0.0f;
+    for (int i = 0; i < HISTORY; i++) {
+        avgBad += history[i];
+    }
+    avgBad /= HISTORY;
+ 
+    bool desiredState = currentBadState;
+ 
+    if (!currentBadState && avgBad > BAD_THRESHOLD) {
+        desiredState = true;
+    }
+    else if (currentBadState && avgBad < GOOD_THRESHOLD) {
+        desiredState = false;
+    }
+ 
+    if (desiredState == currentBadState) {
+        oppositeCount = 0;
+    }
+    else {
+        oppositeCount++;
+ 
+        if (oppositeCount >= REQUIRED_CONSECUTIVE) {
+            currentBadState = desiredState;
+            oppositeCount = 0;
+        }
+    }
+ 
+    if (currentBadState) {
+        digitalWrite(RED_LED, HIGH);
+        digitalWrite(GREEN_LED, LOW);
+        Serial.printf("BAD  raw=%.2f avg=%.2f\n", bad, avgBad);
+    }
+    else {
+        digitalWrite(RED_LED, LOW);
+        digitalWrite(GREEN_LED, HIGH);
+        Serial.printf("GOOD raw=%.2f avg=%.2f\n", bad, avgBad);
+    }
+ 
+ 
+    delay(10); 
+}
